@@ -148,18 +148,22 @@ class LogManager(logDirs: Seq[File],
 
     for (dir <- dirs) {
       try {
+        // liveLogDirs 与 offline日志不能有重叠情况。（日志目录变为offline是由于硬件故障导致的IOException）
         if (initialOfflineDirs.contains(dir))
           throw new IOException(s"Failed to load ${dir.getAbsolutePath} during broker startup")
-
+        // 如果日志目录不存在，则创建
         if (!dir.exists) {
           info(s"Log directory ${dir.getAbsolutePath} not found, creating it.")
           val created = dir.mkdirs()
           if (!created)
             throw new IOException(s"Failed to create data directory ${dir.getAbsolutePath}")
         }
+        // 确保每个日志目录是个目录 且 有可读权限
         if (!dir.isDirectory || !dir.canRead)
           throw new IOException(s"${dir.getAbsolutePath} is not a readable log directory.")
 
+        // 判断日志目录不能重复。
+        // getCanonicalPath函数主要是将路径进行了无歧义的处理，即将文件路径中的相对路径符号去掉了，这样的好处是可以防止一些注入攻击。
         // getCanonicalPath() throws IOException if a file system query fails or if the path is invalid (e.g. contains
         // the Nul character). Since there's no easy way to distinguish between the two cases, we treat them the same
         // and mark the log directory as offline.
@@ -169,10 +173,12 @@ class LogManager(logDirs: Seq[File],
 
         liveLogDirs.add(dir)
       } catch {
+        // 处理异常标记为 offline 日志目录
         case e: IOException =>
           logDirFailureChannel.maybeAddOfflineLogDir(dir.getAbsolutePath, s"Failed to create or validate data directory ${dir.getAbsolutePath}", e)
       }
     }
+    // 工作log目录不能为空，一个都没有则直接退出
     if (liveLogDirs.isEmpty) {
       fatal(s"Shutdown broker because none of the specified log dirs from ${dirs.mkString(", ")} can be created or validated")
       Exit.halt(1)
@@ -255,6 +261,8 @@ class LogManager(logDirs: Seq[File],
   // Only for testing
   private[log] def hasLogsToBeDeleted: Boolean = !logsToBeDeleted.isEmpty
 
+  // 线程池中的job主要工作
+  // loadLog()方法主要是根据一些参数来对每个TopicPartition生成Log对象，用于对每个TopicPartition的日志的操作。
   private def loadLog(logDir: File, recoveryPoints: Map[TopicPartition, Long], logStartOffsets: Map[TopicPartition, Long]): Unit = {
     debug(s"Loading log '${logDir.getName}'")
     val topicPartition = Log.parseTopicPartitionName(logDir)
@@ -274,6 +282,7 @@ class LogManager(logDirs: Seq[File],
       brokerTopicStats = brokerTopicStats,
       logDirFailureChannel = logDirFailureChannel)
 
+    // 如果以'-delete'为后缀，加入addLogToBeDeleted队列等待删除的定时任务
     if (logDir.getName.endsWith(Log.DeleteDirSuffix)) {
       addLogToBeDeleted(log)
     } else {
@@ -307,11 +316,14 @@ class LogManager(logDirs: Seq[File],
 
     for (dir <- liveLogDirs) {
       try {
+        // 对每个日志目录创建numRecoveryThreadsPerDataDir个线程组成的线程池，并加入treadPools中
         val pool = Executors.newFixedThreadPool(numRecoveryThreadsPerDataDir)
         threadPools.append(pool)
 
         val cleanShutdownFile = new File(dir, Log.CleanShutdownFile)
 
+        // 检查.kafka_cleanshutdown文件是否存在
+        // (kafka进程是优雅干净地退出的,会创建一个名为.kafka_cleanshutdown的文件作为标识)
         if (cleanShutdownFile.exists) {
           debug(s"Found clean shutdown file. Skipping recovery for all logs in data directory: ${dir.getAbsolutePath}")
         } else {
@@ -319,6 +331,12 @@ class LogManager(logDirs: Seq[File],
           brokerState.newState(RecoveringFromUncleanShutdown)
         }
 
+        // 从检查点文件读取Topic对应的恢复点offset信息
+        // 文件为recovery-point-offset-checkpoint (这个文件里记录的各个offset之前的数据均已落盘成功，如果内存中维护的某个offset小于这个值以为着可以忽略)
+        // checkpoint file format:
+        // line1 : version
+        // line2 : expectedSize
+        // nlines: (tp, offset)
         var recoveryPoints = Map[TopicPartition, Long]()
         try {
           recoveryPoints = this.recoveryPointCheckpoints(dir).read
@@ -328,6 +346,13 @@ class LogManager(logDirs: Seq[File],
             warn("Resetting the recovery checkpoint to 0")
         }
 
+        // 从检查点文件读取Topic对应的startoffset信息
+        // 文件为log-start-offset-checkpoint (维护所有topic-partition的earliest offset，正常情况下，kafka会每过1分钟更新一次，
+        //   用最小segment的最小offset更新)
+        // checkpoint file format:
+        // line1 : version
+        // line2 : expectedSize
+        // nlines: (tp, startoffset)
         var logStartOffsets = Map[TopicPartition, Long]()
         try {
           logStartOffsets = this.logStartOffsetCheckpoints(dir).read
@@ -336,12 +361,15 @@ class LogManager(logDirs: Seq[File],
             warn(s"Error occurred while reading log-start-offset-checkpoint file of directory $dir", e)
         }
 
+        // 每个日志子目录生成一个线程池的具体job，并提交到线程池中
+        // 每个job的主要任务是通过loadLog()方法加载日志
         val jobsForDir = for {
           dirContent <- Option(dir.listFiles).toList
           logDir <- dirContent if logDir.isDirectory
         } yield {
           CoreUtils.runnable {
             try {
+              // 每个日志子目录生成一个job加载log，并且根据读取的recoveryPoints, logStartOffsets进行加载
               loadLog(logDir, recoveryPoints, logStartOffsets)
             } catch {
               case e: IOException =>
@@ -350,6 +378,8 @@ class LogManager(logDirs: Seq[File],
             }
           }
         }
+
+        // 提交
         jobs(cleanShutdownFile) = jobsForDir.map(pool.submit)
       } catch {
         case e: IOException =>
@@ -359,6 +389,7 @@ class LogManager(logDirs: Seq[File],
     }
 
     try {
+      // 等待所有日志加载的job完成，删除对应的cleanShutdownFile
       for ((cleanShutdownFile, dirJobs) <- jobs) {
         dirJobs.foreach(_.get)
         try {

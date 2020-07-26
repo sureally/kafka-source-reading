@@ -219,6 +219,7 @@ class Log(@volatile var dir: File,
   // After memory mapped buffer is closed, no disk IO operation should be performed for this log
   @volatile private var isMemoryMappedBufferClosed = false
 
+  // 上一次flush的时间，用于日志管理中定期将内存数据刷入磁盘
   /* last time it was flushed */
   private val lastFlushedTime = new AtomicLong(time.milliseconds)
 
@@ -273,12 +274,15 @@ class Log(@volatile var dir: File,
    * equals the log end offset (which may never happen for a partition under consistent load). This is needed to
    * prevent the log start offset (which is exposed in fetch responses) from getting ahead of the high watermark.
    */
+  // highWatermark
   @volatile private var replicaHighWatermark: Option[Long] = None
 
   /* the actual segments of the log */
+  // Kafka的log由顺序的Segment组成
   private val segments: ConcurrentNavigableMap[java.lang.Long, LogSegment] = new ConcurrentSkipListMap[java.lang.Long, LogSegment]
 
   // Visible for testing
+  // 为TopicPartition构建LeaderEpoch => Offset 映射缓存
   @volatile var leaderEpochCache: Option[LeaderEpochFileCache] = None
 
   locally {
@@ -289,6 +293,7 @@ class Log(@volatile var dir: File,
 
     initializeLeaderEpochCache()
 
+    // 载入Segment
     val nextOffset = loadSegments()
 
     /* Calculate the offset of the next message */
@@ -548,9 +553,11 @@ class Log(@volatile var dir: File,
    * @throws LogSegmentOffsetOverflowException if we encounter a .swap file with messages that overflow index offset; or when
    *                                           we find an unexpected number of .log files with overflow
    */
+  // 从磁盘中log文件载入log的Segment
   private def loadSegments(): Long = {
     // first do a pass through the files in the log directory and remove any temporary files
     // and find any interrupted swap operations
+    // 清理临时文件，收集Swap文件，中断Swap操作。
     val swapFiles = removeTempFilesAndCollectSwapFiles()
 
     // Now do a second pass and load all the log and index files.
@@ -562,15 +569,18 @@ class Log(@volatile var dir: File,
       // call to loadSegmentFiles().
       logSegments.foreach(_.close())
       segments.clear()
+      // 载入Segment 和Index文件，将Segment依次加入cache中
       loadSegmentFiles()
     }
 
     // Finally, complete any interrupted swap operations. To be crash-safe,
     // log files that are replaced by the swap segment should be renamed to .deleted
     // before the swap file is restored as the new segment file.
+    // 完成被中断的swap操作。载入SwapSegment并替换对应的Segment,为了保持 crash安全，旧的log文件添加.deleted后缀，后面的定时任务或者下次的系统重启会删除
     completeSwapOperations(swapFiles)
 
     if (!dir.getAbsolutePath.endsWith(Log.DeleteDirSuffix)) {
+      // 根据snapshot恢复Segment各种缓存，根据record进行事务处理初始化等工作
       val nextOffset = retryOnOffsetOverflow {
         recoverLog()
       }
@@ -580,6 +590,7 @@ class Log(@volatile var dir: File,
       nextOffset
     } else {
        if (logSegments.isEmpty) {
+          // 如果Segment列表为空，则新建第一个Segment作为起始
           addSegment(LogSegment.open(dir = dir,
             baseOffset = 0,
             config,
