@@ -1489,6 +1489,7 @@ class Log(@volatile var dir: File,
    *                  (if there is one) and returns true iff it is deletable
    * @return The number of segments deleted
    */
+  // 从最旧的Segment开始逐个通过传入的偏函数进行验证是否需要清理，直到第一次不符合清理条件
   private def deleteOldSegments(predicate: (LogSegment, Option[LogSegment]) => Boolean, reason: String): Int = {
     lock synchronized {
       val deletable = deletableSegments(predicate)
@@ -1498,17 +1499,24 @@ class Log(@volatile var dir: File,
     }
   }
 
+  // 将可删除Segment队列中的Segment进行逐一清理
   private def deleteSegments(deletable: Iterable[LogSegment]): Int = {
     maybeHandleIOException(s"Error while deleting segments for $topicPartition in dir ${dir.getParent}") {
       val numToDelete = deletable.size
       if (numToDelete > 0) {
         // we must always have at least one segment, so if we are going to delete all the segments, create a new one first
+        // Kafka 保证至少有一个Segment进行活动，因此如果清理的数目与现有segment数目相同，则通过Roll()方法生成一个新的Segment
         if (segments.size == numToDelete)
           roll()
         lock synchronized {
           checkIfMemoryMappedBufferClosed()
           // remove the segments for lookups
+          // 逐个删除
+          // 会调用Log.asyncDeleteSegment()方法中删除过程通过线程池并设置delay时间通过异步删除的方式移除Segment
+          // 而延迟删除具体执行过程调用Segment.deleteIfExists()从文件系统中依次删除Segment对应的log,offsetIndex, timeIndex, TxnIndex等文件
           deletable.foreach(deleteSegment)
+
+          // 如果剩余的Segment中第一个Segment的baseOffset > 现在log的StartOffset, 则更新Log的StartOffset及相关的缓存信息
           maybeIncrementLogStartOffset(segments.firstEntry.getValue.baseOffset)
         }
       }
@@ -1528,21 +1536,29 @@ class Log(@volatile var dir: File,
    *                  (if there is one) and returns true iff it is deletable
    * @return the segments ready to be deleted
    */
+  // 从最老的Segment开始，逐个通过传入的匿名函数验证决定是否为可删除的Segment
+  // 如果Segment列表为空或者replicaHighWatermark未设置，则不清理
+  // kafka不清理那些offset在high watermark上面的那些segment，保证logStartOffset不超过HWM
   private def deletableSegments(predicate: (LogSegment, Option[LogSegment]) => Boolean): Iterable[LogSegment] = {
     if (segments.isEmpty || replicaHighWatermark.isEmpty) {
       Seq.empty
     } else {
       val highWatermark = replicaHighWatermark.get
       val deletable = ArrayBuffer.empty[LogSegment]
+      // 从最老的Segment开始往后遍历
       var segmentEntry = segments.firstEntry
       while (segmentEntry != null) {
         val segment = segmentEntry.getValue
         val nextSegmentEntry = segments.higherEntry(segmentEntry.getKey)
+        // nextSegment 为下一个Segment,用于循环控制及获取upperBoundOffset
+        // upperBoundOffset 当前Segment最大偏移量
+        // isLastSegmentAndEmpty 是否是最后一个Segment
         val (nextSegment, upperBoundOffset, isLastSegmentAndEmpty) = if (nextSegmentEntry != null)
           (nextSegmentEntry.getValue, nextSegmentEntry.getValue.baseOffset, false)
         else
           (null, logEndOffset, segment.size == 0)
 
+        // 如果本segment最大偏移量 <= highWatermark 且在匿名函数中返回true 且不是最后一个Segment， 则加入可删除队列中
         if (highWatermark >= upperBoundOffset && predicate(segment, Option(nextSegment)) && !isLastSegmentAndEmpty) {
           deletable += segment
           segmentEntry = nextSegmentEntry
@@ -1562,22 +1578,34 @@ class Log(@volatile var dir: File,
    */
   def deleteOldSegments(): Int = {
     if (config.delete) {
+      // 如果cleanup.policy配置中设置为删除
+      // 通过过期时间，最大保留大小，startOffset等策略进行删除旧的Segment
       deleteRetentionMsBreachedSegments() + deleteRetentionSizeBreachedSegments() + deleteLogStartOffsetBreachedSegments()
     } else {
+      // 如果cleanup.policy配置中设置为不删除，通过startOffset等策略进行删除旧的Segment
+      // 不符合起始偏移
       deleteLogStartOffsetBreachedSegments()
     }
   }
 
   private def deleteRetentionMsBreachedSegments(): Int = {
+    // retentionMs过期时间为负，则永久保留，不进行清理
     if (config.retentionMs < 0) return 0
+    // 可以清理的最大清理大小
     val startMs = time.milliseconds
+    // deleteOldSegments()方法中用于过滤的callback
+    // 如果当前Segment的size <= 剩余可以清理的最大清理大小则执行清理操作
     deleteOldSegments((segment, _) => startMs - segment.largestTimestamp > config.retentionMs,
       reason = s"retention time ${config.retentionMs}ms breach")
   }
 
   private def deleteRetentionSizeBreachedSegments(): Int = {
+    // 如果retentionSize未负，则表示永久保留，如果当前Log的size < retentionSize,则无需清理
     if (config.retentionSize < 0 || size < config.retentionSize) return 0
+    // 可以清理的最大清理大小
     var diff = size - config.retentionSize
+    // deleteOldSegments()方法中用于过滤的callback
+    // 如果当前Segment的size <= 剩余可以清理的最大清理大小则执行清理操作
     def shouldDelete(segment: LogSegment, nextSegmentOpt: Option[LogSegment]) = {
       if (diff - segment.size >= 0) {
         diff -= segment.size
@@ -1590,6 +1618,14 @@ class Log(@volatile var dir: File,
     deleteOldSegments(shouldDelete, reason = s"retention size in bytes ${config.retentionSize} breach")
   }
 
+  // 清理那些最后一个offset < 当前log的logStartOffset的segment
+  // 程序中用nextSegment的baseOffset来简化代码, 且如果nextSegment为Nil，则当前Segment为最后一个Segment，也不进行清理
+  /**
+   * 一般情况下，日志文件的起始偏移量 logStartOffset 等于第一个日志分段的 baseOffset，但这并不是绝对的，
+   * logStartOffset 的值可以通过 DeleteRecordsRequest 请求(比如使用 KafkaAdminClient 的 deleteRecords()方法、
+   * 使用 kafka-delete-records.sh 脚本、日志的清理和截断等操作进行修改。
+   * @return
+   */
   private def deleteLogStartOffsetBreachedSegments(): Int = {
     def shouldDelete(segment: LogSegment, nextSegmentOpt: Option[LogSegment]) =
       nextSegmentOpt.exists(_.baseOffset <= logStartOffset)
@@ -1752,17 +1788,23 @@ class Log(@volatile var dir: File,
    *
    * @param offset The offset to flush up to (non-inclusive); the new recovery point
    */
+  // 传入的Offset参数标识希望这次刷数据的最大偏移量(不包含)，并作为新的recoveryPoint
   def flush(offset: Long) : Unit = {
     maybeHandleIOException(s"Error while flushing log for $topicPartition in dir ${dir.getParent} with offset $offset") {
+      // this.recoveryPoint 这个参数表示第一个为被刷到磁盘上的偏移量
+      // 如果传入的Offset不大于这个值，刷入磁盘的最大offset大于这个预期的上线，所以什么也不做结束这个方法
       if (offset <= this.recoveryPoint)
         return
       debug(s"Flushing log up to offset $offset, last flushed: $lastFlushTime,  current time: ${time.milliseconds()}, " +
         s"unflushed: $unflushedMessages")
+      // 在[this.recoveryPoint, offset]区间内的所有logSegment逐个持久化
       for (segment <- logSegments(this.recoveryPoint, offset))
+        //  Segment对应的log, offsetIndex, timeIndex, txnIndex分别进行flush()写入磁盘
         segment.flush()
 
       lock synchronized {
         checkIfMemoryMappedBufferClosed()
+        // 如果刷数据上限 > this.recoveryPoint, 则更新恢复点及更新lastFlushedTime
         if (offset > this.recoveryPoint) {
           this.recoveryPoint = offset
           lastFlushedTime.set(time.milliseconds)

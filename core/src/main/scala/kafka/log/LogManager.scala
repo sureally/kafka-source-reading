@@ -420,34 +420,42 @@ class LogManager(logDirs: Seq[File],
    */
   def startup() {
     /* Schedule the cleanup task to delete old logs */
+    // 后台线程池不为空的情况下，进行日志管理后台任务的启动
     if (scheduler != null) {
       info("Starting log cleanup with a period of %d ms.".format(retentionCheckMs))
+      // 定期清理合适的segment
       scheduler.schedule("kafka-log-retention",
                          cleanupLogs _,
                          delay = InitialTaskDelayMs,
                          period = retentionCheckMs,
                          TimeUnit.MILLISECONDS)
       info("Starting log flusher with a default period of %d ms.".format(flushCheckMs))
+      // 定期刷日志，将内存中未持久化的脏数据刷到磁盘上
       scheduler.schedule("kafka-log-flusher",
                          flushDirtyLogs _,
                          delay = InitialTaskDelayMs,
                          period = flushCheckMs,
                          TimeUnit.MILLISECONDS)
+      // 定期设置检查点写入到文件，避免启动时从整个文件进行恢复Kafka
       scheduler.schedule("kafka-recovery-point-checkpoint",
                          checkpointLogRecoveryOffsets _,
                          delay = InitialTaskDelayMs,
                          period = flushRecoveryOffsetCheckpointMs,
                          TimeUnit.MILLISECONDS)
+      // 定期将当前的Log的start offset写入检查点文件，避免暴露被DeleteRecordsRequest删除的脏数据
       scheduler.schedule("kafka-log-start-offset-checkpoint",
                          checkpointLogStartOffsets _,
                          delay = InitialTaskDelayMs,
                          period = flushStartOffsetCheckpointMs,
                          TimeUnit.MILLISECONDS)
+      // 定期删除标记为-delete的日志
+      // deleteLogs定时任务比较特殊，并未直接设置调度间隔。执行这部分的后台线程是由前一次后台任务完成时动态进行调度的。
       scheduler.schedule("kafka-delete-logs", // will be rescheduled after each delete logs with a dynamic period
                          deleteLogs _,
                          delay = InitialTaskDelayMs,
                          unit = TimeUnit.MILLISECONDS)
     }
+    // 日志清理压缩线程启动
     if (cleanerConfig.enableCleaner)
       cleaner.startup()
   }
@@ -919,6 +927,8 @@ class LogManager(logDirs: Seq[File],
   /**
    * Delete any eligible logs. Return the number of segments deleted.
    * Only consider logs that are not compacted.
+   *
+   * 清理旧的segment
    */
   def cleanupLogs() {
     debug("Beginning log cleanup...")
@@ -926,6 +936,8 @@ class LogManager(logDirs: Seq[File],
     val startMs = time.milliseconds
 
     // clean current logs.
+    // 为了避免用户切换topic清理policy导致的潜在竞争，增加了这个。
+    // 排除了所有设置了日志压缩选项的log
     val deletableLogs = {
       if (cleaner != null) {
         // prevent cleaner from working on same partitions when changing cleanup policy
@@ -941,6 +953,7 @@ class LogManager(logDirs: Seq[File],
       deletableLogs.foreach {
         case (topicPartition, log) =>
           debug(s"Garbage collecting '${log.name}'")
+          // 定期调用 deleteOldSegments 进行清理
           total += log.deleteOldSegments()
 
           val futureLog = futureLogs.get(topicPartition)
@@ -991,11 +1004,15 @@ class LogManager(logDirs: Seq[File],
   /**
    * Flush any log which has exceeded its flush interval and has unwritten messages.
    */
+  // 基于超时时间的刷数据到日志文件
   private def flushDirtyLogs(): Unit = {
     debug("Checking for dirty logs to flush...")
 
+    // futureLogs是用户将副本在同一台Broker上从某个文件夹迁移到另一个文件夹下时被创建，当它赶上currentLogs后会替换掉currentLogs
+    // 这里清理过程中一并清理
     for ((topicPartition, log) <- currentLogs.toList ++ futureLogs.toList) {
       try {
+        // 距离上一次刷数据时间超过了配置的刷新间隔则将log中未持久化的数据刷到磁盘
         val timeSinceLastFlush = time.milliseconds - log.lastFlushTime
         debug(s"Checking if flush is needed on ${topicPartition.topic} flush interval ${log.config.flushMs}" +
               s" last flushed ${log.lastFlushTime} time since last flush: $timeSinceLastFlush")
