@@ -63,6 +63,15 @@ import java.util.stream.Collectors;
  * user-facing producer and consumer clients.
  * <p>
  * This class is not thread-safe!
+ *
+ * 用于处理客户端网络请求。
+ * NetworkClient客户端网络连接对象管理了客户端和服务端之间的网络通信，包括连接的建立、发送客户端请求、读取客户端响应。
+ *
+ * 客户端是否需要响应结果的两种场景下，从队列中删除或添加请求的顺序。
+ * 1）不需要响应的流程：开始发送请求-》添加客户端请求到队列-》发送请求-》请求发送成功-》从队列中删除发送请求-》构造客户端响应
+ * 2）需要响应的流程：开始发送请求-》添加客户端请求到队列-》发送请求-》请求发送成功-》等待接收响应-》接收响应-》接收到完整的响应-》从队列中删除客户端请求-》构造客户端响应。
+ *
+ * ？疑问：在2.2 中客户端响应仅包含回调对象，没有包含客户端请求。？：客户端响应包含客户端请求的目的是：根据响应获取请求中的回调对象，在收到响应后调用回调函数。
  */
 public class NetworkClient implements KafkaClient {
 
@@ -274,6 +283,7 @@ public class NetworkClient implements KafkaClient {
      * @param now The current timestamp
      * @return True if we are ready to send to the given node
      */
+    // 从记录收集器获取准备完毕的节点，请连接所有准备好的节点
     @Override
     public boolean ready(Node node, long now) {
         if (node.isEmpty())
@@ -284,8 +294,10 @@ public class NetworkClient implements KafkaClient {
 
         if (connectionStates.canConnect(node.idString(), now))
             // if we are interested in sending to a node and we don't have a connection to it, initiate one
+            // 允许连接但是还没有连接，就初始化连接
             initiateConnect(node, now);
 
+        // 不允许连接，或者刚刚初始化，都不算准备好
         return false;
     }
 
@@ -428,6 +440,11 @@ public class NetworkClient implements KafkaClient {
      * @param request The request
      * @param now The current timestamp
      */
+    // 为每个节点创建一个客户端请求，将请求暂存到节点对应的通道中。
+    // 连接建立好后，发送线程调用NetworkClient.send()，先将客户端请求加入 inFlightRequests列表，然后再调用 selector。send() 方法
+    // 注意：这一步只是将请求暂存到节点对应的网络通道中，还没有真正地将客户端请求发送出去。
+    // TODO: 这个存疑？为了保证服务端的处理性能，客户端网络连接对象有一个限制条件，针对同一个服务端，如果上一个客户端请求还没有发送完成，则不允许
+    // 发送新的客户端请求。
     @Override
     public void send(ClientRequest request, long now) {
         doSend(request, false, now);
@@ -504,7 +521,9 @@ public class NetworkClient implements KafkaClient {
                 request,
                 send,
                 now);
+        // 还没有开始真正发送，先加入队列
         this.inFlightRequests.add(inFlightRequest);
+        // 发送对象是客户端请求中的RequestSend
         selector.send(send);
     }
 
@@ -517,6 +536,9 @@ public class NetworkClient implements KafkaClient {
      * @param now The current time in milliseconds
      * @return The list of responses received
      */
+    // 轮询的最关键步骤是调用selector.poll() 方法，而在轮询之后，定义了多个处理方法。轮询不仅仅会发送客户端请求，也会接受客户端响应。
+    // 客户端发送请求后会调用 handleCompletedSends() 处理已经完成的发送；
+    // 客户端接收到响应后会调用 handleCompleteReceives() 处理已经完成的接收
     @Override
     public List<ClientResponse> poll(long timeout, long now) {
         ensureActive();
@@ -540,12 +562,19 @@ public class NetworkClient implements KafkaClient {
         // process completed actions
         long updatedNow = this.time.milliseconds();
         List<ClientResponse> responses = new ArrayList<>();
+        // 完成发送的处理器
         handleCompletedSends(responses, updatedNow);
+        // 完成接收的处理器
         handleCompletedReceives(responses, updatedNow);
+        // 断开连接的处理器
         handleDisconnections(responses, updatedNow);
+        // 处理连接的处理器
         handleConnections();
         handleInitiateApiVersionRequests(updatedNow);
+        // 超时请求的处理器
         handleTimedOutRequests(responses, updatedNow);
+
+        // 上面几个处理都会往responses中添加数据，有了响应后开始调用请求的回调函数。
         completeResponses(responses);
 
         return responses;
@@ -769,11 +798,13 @@ public class NetworkClient implements KafkaClient {
      * @param responses The list of responses to update
      * @param now The current time
      */
+    // 处理已经完成的发送请求，如果不期望得到响应，就认为整个请求全部完成
     private void handleCompletedSends(List<ClientResponse> responses, long now) {
         // if no response is expected then when the send is completed, return it
         for (Send send : this.selector.completedSends()) {
             InFlightRequest request = this.inFlightRequests.lastSent(send.destination());
             if (!request.expectResponse) {
+                // 不需要响应，发送完请求就结束了
                 this.inFlightRequests.completeLastSent(send.destination());
                 responses.add(request.completed(null, now));
             }
@@ -804,9 +835,11 @@ public class NetworkClient implements KafkaClient {
      * @param responses The list of responses to update
      * @param now The current time
      */
+    // 处理已经完成的接收请求，根据接收到的响应更新响应列表
     private void handleCompletedReceives(List<ClientResponse> responses, long now) {
         for (NetworkReceive receive : this.selector.completedReceives()) {
             String source = receive.source();
+            // 接收到完整的响应了，现在可以删除 inFlightRequest 中的 ClientRequest
             InFlightRequest req = inFlightRequests.completeNext(source);
             Struct responseStruct = parseStructMaybeUpdateThrottleTimeMetrics(receive.payload(), req.header,
                 throttleTimeSensor, now);

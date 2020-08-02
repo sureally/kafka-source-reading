@@ -70,6 +70,13 @@ import static org.apache.kafka.common.record.RecordBatch.NO_TIMESTAMP;
 /**
  * The background thread that handles the sending of produce requests to the Kafka cluster. This thread makes metadata
  * requests to renew its view of the cluster and then sends produce requests to the appropriate nodes.
+ *
+ * 负责读取记录收集器的批量消息，通过网络发送给服务端。
+ *
+ * Sender线程迭代batches的每个分区，获取分区对应的主副本节点，取出分区对应的队列中的批记录就可以发送消息了。
+ *
+ * 注意：发送线程并不负责真正发送客户端请求，它会从记录收集器中取出要发送的消息，创建好客户端请求，然后把请求交给客户端网络对象（NetworkClient）去发送。
+ * 因为没有在发送线程中发送请求，所以创建客户端请求时需要保留目标节点，这样客户端网络对象获取出客户端请求时，才能知道要发送给哪个目标节点。
  */
 public class Sender implements Runnable {
 
@@ -309,12 +316,15 @@ public class Sender implements Runnable {
 
         long currentTimeMs = time.milliseconds();
         long pollTimeout = sendProducerData(currentTimeMs);
+        // 这里才会真正的网络读写请求，比如将上面的客户端请求真正发送出去
         client.poll(pollTimeout, currentTimeMs);
     }
 
+    //
     private long sendProducerData(long now) {
         Cluster cluster = metadata.fetch();
         // get the list of partitions with data ready to send
+        // 获取准备好的分区
         RecordAccumulator.ReadyCheckResult result = this.accumulator.ready(cluster, now);
 
         // if there are any partitions whose leaders are not known yet, force metadata update
@@ -331,6 +341,7 @@ public class Sender implements Runnable {
         }
 
         // remove any nodes we aren't ready to send to
+        // 建立到主副本节点的网络连接，移除还没有准备好的节点
         Iterator<Node> iter = result.readyNodes.iterator();
         long notReadyTimeout = Long.MAX_VALUE;
         while (iter.hasNext()) {
@@ -342,6 +353,7 @@ public class Sender implements Runnable {
         }
 
         // create produce requests
+        // 读取记录收集器，返回的每个主副本节点对应的批记录列表，每个批记录对应一个分区
         Map<Integer, List<ProducerBatch>> batches = this.accumulator.drain(cluster, result.readyNodes, this.maxRequestSize, now);
         addToInflightBatches(batches);
         if (guaranteeMessageOrder) {
@@ -737,6 +749,8 @@ public class Sender implements Runnable {
 
     /**
      * Transfer the record batches into a list of produce requests on a per-node basis
+     *
+     * 以节点为级别的生产请求列表，即每个节点只有一个客户端请求
      */
     private void sendProduceRequests(Map<Integer, List<ProducerBatch>> collated, long now) {
         for (Map.Entry<Integer, List<ProducerBatch>> entry : collated.entrySet())
@@ -746,6 +760,8 @@ public class Sender implements Runnable {
     /**
      * Create a produce request from the given record batches
      */
+    // 创建生产者客户端请求
+    //
     private void sendProduceRequest(long now, int destination, short acks, int timeout, List<ProducerBatch> batches) {
         if (batches.isEmpty())
             return;
@@ -754,6 +770,7 @@ public class Sender implements Runnable {
         final Map<TopicPartition, ProducerBatch> recordsByPartition = new HashMap<>(batches.size());
 
         // find the minimum magic version used when creating the record sets
+        // 先寻找判断，都是不断迭代的历史包袱，不然没必要两次迭代
         byte minUsedMagic = apiVersions.maxUsableProduceMagic();
         for (ProducerBatch batch : batches) {
             if (batch.magic() < minUsedMagic)
@@ -761,7 +778,10 @@ public class Sender implements Runnable {
         }
 
         for (ProducerBatch batch : batches) {
+            // 每一个ProducerBatch都有唯一的TopicPartion
+
             TopicPartition tp = batch.topicPartition;
+            // MemoryRecords 底层是 ByteBuffer
             MemoryRecords records = batch.records();
 
             // down convert if necessary to the minimum magic used. In general, there can be a delay between the time
@@ -781,8 +801,10 @@ public class Sender implements Runnable {
         if (transactionManager != null && transactionManager.isTransactional()) {
             transactionalId = transactionManager.transactionalId();
         }
+        // 生产者请求的Builder，最后封装为统一的客户端请求
         ProduceRequest.Builder requestBuilder = ProduceRequest.Builder.forMagic(minUsedMagic, acks, timeout,
                 produceRecordsByPartition, transactionalId);
+        // 回调函数作为客户端请求的一个成员变量，当客户端请求完成后，会调用回调函数
         RequestCompletionHandler callback = new RequestCompletionHandler() {
             public void onComplete(ClientResponse response) {
                 handleProduceResponse(response, recordsByPartition, time.milliseconds());
@@ -792,6 +814,7 @@ public class Sender implements Runnable {
         String nodeId = Integer.toString(destination);
         ClientRequest clientRequest = client.newClientRequest(nodeId, requestBuilder, now, acks != 0,
                 requestTimeoutMs, callback);
+        // 将请求放入队列中并等待发送，请求只能发送给准备好的节点
         client.send(clientRequest, now);
         log.trace("Sent produce request to {}: {}", nodeId, requestBuilder);
     }

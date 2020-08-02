@@ -63,6 +63,9 @@ import org.slf4j.Logger;
  * <p>
  * The accumulator uses a bounded amount of memory and append calls will block when that memory is exhausted, unless
  * this behavior is explicitly disabled.
+ *
+ * 记录收集器：负责缓存生产者客户端产生的消息
+ * 生产者发送的消息先在客户端缓存到记录收集器RecordAccumulator中，等到一定时机再由发送线程Sender批量地写入Kafka集群。
  */
 public final class RecordAccumulator {
 
@@ -180,6 +183,11 @@ public final class RecordAccumulator {
      * @param callback The user-supplied callback to execute when the request is complete
      * @param maxTimeToBlock The maximum time in milliseconds to block for buffer memory to be available
      */
+    // 设计思考：这个RecordAppendResult 作为一个不可变类放在这个RecordAccumulater中，可以将代码更加聚合。
+    // 每个分区都有一个双端队列用于缓存客户端消息，队列每个元素都是一个批记录；
+    // 一旦分区的队列中由批记录满了，就会被发送线程发送到分区对应的节点，如果批记录没有满，就会继续等待直到收集到足够的消息。
+
+    // TODO: 可以学习绘制这里的逻辑。
     public RecordAppendResult append(TopicPartition tp,
                                      long timestamp,
                                      byte[] key,
@@ -626,11 +634,13 @@ public final class RecordAccumulator {
     /**
      * Get the deque for the given topic-partition, creating it if necessary.
      */
+    // 这样的实现是线程安全的
     private Deque<ProducerBatch> getOrCreateDeque(TopicPartition tp) {
         Deque<ProducerBatch> d = this.batches.get(tp);
         if (d != null)
             return d;
         d = new ArrayDeque<>();
+        // putIfAbsent是线程安全的，也就是说，即使并发调用，有且仅有一个线程会返回null
         Deque<ProducerBatch> previous = this.batches.putIfAbsent(tp, d);
         if (previous == null)
             return d;

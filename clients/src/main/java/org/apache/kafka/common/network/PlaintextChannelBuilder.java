@@ -48,6 +48,7 @@ public class PlaintextChannelBuilder implements ChannelBuilder {
         this.configs = configs;
     }
 
+    // 选择器在连接服务端时构建kafka通道
     @Override
     public KafkaChannel buildChannel(String id, SelectionKey key, int maxReceiveSize, MemoryPool memoryPool) throws KafkaException {
         try {

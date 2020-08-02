@@ -26,6 +26,7 @@ import org.slf4j.LoggerFactory;
 
 /**
  * A size delimited Receive that consists of a 4 byte network-ordered size N followed by N bytes of content
+ * 多包含了4个字节，用于表示内容的大小（包含这个四个字节）
  */
 public class NetworkReceive implements Receive {
 

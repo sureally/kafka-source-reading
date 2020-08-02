@@ -83,6 +83,17 @@ import java.util.concurrent.atomic.AtomicReference;
  * various getters. These are reset by each call to <code>poll()</code>.
  *
  * This class is not thread safe!
+ *
+ * kafka 使用Selector处理网络连接和读写处理。
+ *
+ * SocketChannel、选择键、传输层、kafka通道的关系为：
+ * SocketChannel注册到选择器上返回选择键，将选择器用于构造传输层，再把传输层用于构造kafka通道。这样kafka通道就和socketChannel通过选择键进行了关联，
+ * 本质上Kafka通道是对原始的socketChannel的一层包装。
+ *
+ * selector是基于nioSelector的封装，而创建连接的一系列操作都是由Channel去完成，KafkaChannel不仅封装了SocketChannel，
+ * 还封装了Kafka自己的认证器Authenticator，和读写相关的NetworkReceive、Send。这个中间多个一个间接层：TransportLayer，
+ * 为了封装普通和加密的Channel（TransportLayer根据网络协议的不同，提供不同的子类）
+ * 而对于KafkaChannel提供统一的接口，这是策略模式很好的应用。
  */
 public class Selector implements Selectable, AutoCloseable {
 
@@ -249,6 +260,7 @@ public class Selector implements Selectable, AutoCloseable {
      * @throws IOException if DNS resolution fails on the hostname or if the broker is down
      */
     @Override
+    // 客户端的选择器 Selector 连接远程的服务端节点
     public void connect(String id, InetSocketAddress address, int sendBufferSize, int receiveBufferSize) throws IOException {
         ensureNotRegistered(id);
         SocketChannel socketChannel = SocketChannel.open();
@@ -286,6 +298,7 @@ public class Selector implements Selectable, AutoCloseable {
     private void configureSocketChannel(SocketChannel socketChannel, int sendBufferSize, int receiveBufferSize)
             throws IOException {
         socketChannel.configureBlocking(false);
+        // 这是客户端，所以返回的是Socket
         Socket socket = socketChannel.socket();
         socket.setKeepAlive(true);
         if (sendBufferSize != Selectable.USE_DEFAULT_BUFFER_SIZE)
@@ -325,6 +338,7 @@ public class Selector implements Selectable, AutoCloseable {
     protected SelectionKey registerChannel(String id, SocketChannel socketChannel, int interestedOps) throws IOException {
         SelectionKey key = socketChannel.register(nioSelector, interestedOps);
         KafkaChannel channel = buildAndAttachKafkaChannel(socketChannel, id, key);
+        // 选择器还维护了每个节点编号和Kafka通道的映射关系
         this.channels.put(id, channel);
         if (idleExpiryManager != null)
             idleExpiryManager.update(channel.id(), time.nanoseconds());
@@ -334,6 +348,7 @@ public class Selector implements Selectable, AutoCloseable {
     private KafkaChannel buildAndAttachKafkaChannel(SocketChannel socketChannel, String id, SelectionKey key) throws IOException {
         try {
             KafkaChannel channel = channelBuilder.buildChannel(id, key, maxReceiveSize, memoryPool);
+            // 将kafka通道注册到选择键上
             key.attach(channel);
             return channel;
         } catch (Exception e) {

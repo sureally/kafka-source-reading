@@ -25,6 +25,8 @@ import org.apache.kafka.common.memory.MemoryPool;
 
 /**
  * A ChannelBuilder interface to build Channel based on configs
+ *
+ * 构建Kafka通道的传输层，这个接口的实现有多种，纯文本模式/sasl/ssl加密模式。
  */
 public interface ChannelBuilder extends AutoCloseable, Configurable {
 

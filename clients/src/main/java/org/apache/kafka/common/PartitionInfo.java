@@ -25,7 +25,7 @@ public class PartitionInfo {
     private final Node leader;
     private final Node[] replicas;
     private final Node[] inSyncReplicas;
-    private final Node[] offlineReplicas;
+    private final Node[] offlineReplicas; // 后续增加的一个属性，是为了修复？
 
     // Used only by tests
     public PartitionInfo(String topic, int partition, Node leader, Node[] replicas, Node[] inSyncReplicas) {

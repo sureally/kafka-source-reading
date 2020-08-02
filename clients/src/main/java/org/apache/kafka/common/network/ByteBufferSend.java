@@ -26,8 +26,11 @@ import java.nio.channels.GatheringByteChannel;
  */
 public class ByteBufferSend implements Send {
 
+    // 目标地址
     private final String destination;
+    // 计算 buffer的字节大小
     private final int size;
+    // 要发送的内容（说明kafka一次传输字节是有限的）
     protected final ByteBuffer[] buffers;
     private int remaining;
     private boolean pending = false;
@@ -55,8 +58,10 @@ public class ByteBufferSend implements Send {
         return this.size;
     }
 
+    // 将字节流写入到channel中
     @Override
     public long writeTo(GatheringByteChannel channel) throws IOException {
+        // 发送有channel.write实现，实现了kafka的send与channel的解耦
         long written = channel.write(buffers);
         if (written < 0)
             throw new EOFException("Wrote negative bytes to channel. This shouldn't happen.");

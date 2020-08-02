@@ -633,6 +633,7 @@ class LogManager(logDirs: Seq[File],
   private[log] def checkpointRecoveryOffsetsAndCleanSnapshot(dir: File, logsToCleanSnapshot: Seq[Log]): Unit = {
     try {
       checkpointLogRecoveryOffsetsInDir(dir)
+      // 写入恢复检查点后删除旧的snapshots
       logsToCleanSnapshot.foreach(_.deleteSnapshotsAfterRecoveryPointCheckpoint())
     } catch {
       case e: IOException =>
@@ -641,6 +642,12 @@ class LogManager(logDirs: Seq[File],
     }
   }
 
+  // 将给定文件夹下的所有tp对应的恢复点写入对应的recovery-point-offset-checkpoint文件
+  // 文件为recovery-point-offset-checkpoint
+  // checkpoint file format:
+  // line1 : version
+  // line2 : expectedSize
+  // nlines: (tp, offset)
   private def checkpointLogRecoveryOffsetsInDir(dir: File): Unit = {
     for {
       partitionToLog <- logsByDir.get(dir.getAbsolutePath)

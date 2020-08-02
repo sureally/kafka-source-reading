@@ -27,6 +27,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * The set of requests which have been sent or are being sent but haven't yet received a response
+ *
+ * 该队列保存的是 未收到响应的客户端请求
  */
 final class InFlightRequests {
 

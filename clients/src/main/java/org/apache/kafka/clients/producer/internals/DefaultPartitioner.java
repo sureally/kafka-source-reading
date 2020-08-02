@@ -51,6 +51,8 @@ public class DefaultPartitioner implements Partitioner {
      * @param valueBytes serialized value to partition on or null
      * @param cluster The current cluster metadata
      */
+    // 如果没有指定 key 则采用round-robin方式，均衡地发送到不同的分区
+    // 如果指定了 key 则默认采用散列化后取模运算：因为对一个不变的建进行散列化的结果永远是同一个值，所以只要分区数量不变，相同键的所有消息总是会被写到同一个分区中。
     public int partition(String topic, Object key, byte[] keyBytes, Object value, byte[] valueBytes, Cluster cluster) {
         List<PartitionInfo> partitions = cluster.partitionsForTopic(topic);
         int numPartitions = partitions.size();
